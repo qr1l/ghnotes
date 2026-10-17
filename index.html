@@ -1,101 +1,15 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Notes — a personal study notes app</title>
-  <meta name="description" content="A personal, non-commercial note-taking app for studying: free-form canvas pages, handwriting and sketches, offline-first, synced to the author's own GitHub repository.">
-  <style>
-    :root {
-      --bg: #fafaf8;
-      --text: #1f1f1d;
-      --muted: #5f5e5a;
-      --card: #ffffff;
-      --border: #e3e2dc;
-      --accent: #2f5fd0;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #181816;
-        --text: #ecebe6;
-        --muted: #a3a29b;
-        --card: #222220;
-        --border: #34342f;
-        --accent: #7f9ef0;
-      }
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 0 16px;
-      background: var(--bg);
-      color: var(--text);
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      line-height: 1.6;
-    }
-    main {
-      max-width: 720px;
-      margin: 0 auto;
-      padding: 48px 0 64px;
-    }
-    h1 { font-size: 1.9rem; margin: 0 0 8px; }
-    .status {
-      display: inline-block;
-      padding: 2px 10px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      color: var(--muted);
-      font-size: 0.85rem;
-      margin-bottom: 24px;
-    }
-    p { margin: 0 0 16px; }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 20px 24px;
-      margin: 24px 0;
-    }
-    h2 { font-size: 1.1rem; margin: 0 0 12px; }
-    ul { margin: 0; padding-left: 20px; }
-    li { margin-bottom: 6px; }
-    .muted { color: var(--muted); font-size: 0.9rem; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Notes</h1>
-    <span class="status">Work in progress</span>
-
-    <p>
-      A personal study notes app that I am building for myself as a student.
-      Each note is a set of pages with a free-form canvas where text, hand-drawn
-      sketches, images and scanned fragments of paper notes can be placed anywhere.
-    </p>
-
-    <div class="card">
-      <h2>Planned features</h2>
-      <ul>
-        <li>Free-form canvas pages with text, drawing (finger, stylus or mouse) and images</li>
-        <li>Works offline as an installable web app (PWA) on Android and desktop</li>
-        <li>Notes are stored in my own private GitHub repository and synced when online</li>
-        <li>Photo import of handwritten notes: text recognition and diagrams cut out as separate image blocks</li>
-      </ul>
-    </div>
-
-    <div class="card">
-      <h2>Technology</h2>
-      <ul>
-        <li>TypeScript, React, Vite</li>
-        <li>tldraw for the canvas editor</li>
-        <li>GitHub API for storage and sync</li>
-      </ul>
-    </div>
-
-    <p class="muted">
-      This is a strictly non-commercial personal project: it has no ads, payments or
-      user accounts, and it is used only by its author.
-    </p>
-  </main>
-</body>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#2f5fd0" />
+    <link rel="icon" type="image/svg+xml" href="/ghnotes/icon.svg" />
+    <link rel="apple-touch-icon" href="/ghnotes/icon-192.png" />
+    <title>Notes</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>

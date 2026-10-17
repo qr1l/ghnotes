@@ -1,0 +1,13 @@
+html, body, #root {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.app {
+  position: fixed;
+  inset: 0;
+}
