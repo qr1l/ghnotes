@@ -4,7 +4,7 @@ import { buildNotePath, navigate } from '../router'
 import { buildSignature } from '../version'
 
 // Правила имён из раздела «Принятые решения»:
-// убирать / \ : * ? " < > |, обрезать пробелы, максимум 60 символов,
+// убираать / \ : * ? " < > |, обрезать пробелы, максимум 60 символов,
 // кириллица разрешена, при совпадении добавлять « (2)», « (3)».
 
 function sanitizeName(name: string): string {
@@ -25,34 +25,49 @@ type DialogState =
   | { kind: 'new-topic' }
   | { kind: 'new-note'; topic: string }
 
+interface TopicWithNotes {
+  name: string
+  notes: NoteRecord[]
+}
+
 export function ListPage() {
   const [notes, setNotes] = useState<NoteRecord[]>([])
+  const [topicNames, setTopicNames] = useState<string[]>([])
   const [selectedTopic, setSelectedTopic] = useState<string | null>(null)
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' })
   const [inputValue, setInputValue] = useState('')
 
   const refresh = async () => {
-    const all = await db.notes.toArray()
-    all.sort((a, b) => a.topic.localeCompare(b.topic, 'ru') || a.title.localeCompare(b.title, 'ru'))
-    setNotes(all)
+    const allNotes = await db.notes.toArray()
+    allNotes.sort((a, b) => a.topic.localeCompare(b.topic, 'ru') || a.title.localeCompare(b.title, 'ru'))
+    setNotes(allNotes)
+
+    const allTopics = await db.topics.toArray()
+    const names = new Set(allTopics.map((topic) => topic.name))
+    for (const note of allNotes) {
+      names.add(note.topic)
+    }
+    setTopicNames(Array.from(names).sort((a, b) => a.localeCompare(b, 'ru')))
   }
 
   useEffect(() => {
     void refresh()
   }, [])
 
-  const topics = useMemo(() => {
+  // Список тем = таблица topics + темы существующих конспектов.
+  // Пустая тема (без конспектов) остаётся в списке.
+  const topics = useMemo<TopicWithNotes[]>(() => {
     const map = new Map<string, NoteRecord[]>()
     for (const note of notes) {
       const list = map.get(note.topic) ?? []
       list.push(note)
       map.set(note.topic, list)
     }
-    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0], 'ru'))
-  }, [notes])
+    return topicNames.map((name) => ({ name, notes: map.get(name) ?? [] }))
+  }, [notes, topicNames])
 
   const selectedNotes = useMemo(
-    () => (selectedTopic ? (topics.find(([topic]) => topic === selectedTopic)?.[1] ?? []) : []),
+    () => (selectedTopic ? (topics.find((topic) => topic.name === selectedTopic)?.notes ?? []) : []),
     [topics, selectedTopic]
   )
 
@@ -69,19 +84,10 @@ export function ListPage() {
     }
 
     if (dialog.kind === 'new-topic') {
-      const existing = topics.map(([topic]) => topic)
-      const finalName = uniqueName(name, existing)
+      // «Новая тема» создаёт только тему, без конспекта.
+      const finalName = uniqueName(name, topicNames)
       if (finalName) {
-        const now = new Date().toISOString()
-        await db.notes.add({
-          path: `${finalName}/${finalName}`,
-          topic: finalName,
-          title: finalName,
-          data: { format: 1, title: finalName, createdAt: now, updatedAt: now, snapshot: {} },
-          baseSha: null,
-          dirty: true,
-          updatedAt: now
-        })
+        await db.topics.add({ name: finalName, createdAt: new Date().toISOString() })
       }
     } else if (dialog.kind === 'new-note') {
       const existing = selectedNotes.map((note) => note.title)
@@ -93,6 +99,7 @@ export function ListPage() {
           topic: dialog.topic,
           title: finalName,
           data: { format: 1, title: finalName, createdAt: now, updatedAt: now, snapshot: {} },
+          session: {},
           baseSha: null,
           dirty: true,
           updatedAt: now
@@ -111,11 +118,17 @@ export function ListPage() {
     await refresh()
   }
 
-  const handleDeleteTopic = async (topic: string) => {
-    const topicNotes = topics.find(([t]) => t === topic)?.[1] ?? []
-    if (!window.confirm(`Удалить тему «${topic}» и все её конспекты (${topicNotes.length})?`)) return
-    await db.notes.where('topic').equals(topic).delete()
-    if (selectedTopic === topic) setSelectedTopic(null)
+  // Удаление темы удаляет и её конспекты, с подтверждением.
+  const handleDeleteTopic = async (topic: TopicWithNotes) => {
+    const message = topic.notes.length > 0
+      ? `Удалить тему «${topic.name}» и все её конспекты (${topic.notes.length})?`
+      : `Удалить тему «${topic.name}»?`
+    if (!window.confirm(message)) return
+    await db.transaction('rw', db.topics, db.notes, async () => {
+      await db.topics.delete(topic.name)
+      await db.notes.where('topic').equals(topic.name).delete()
+    })
+    if (selectedTopic === topic.name) setSelectedTopic(null)
     await refresh()
   }
 
@@ -153,10 +166,10 @@ export function ListPage() {
               </button>
             </div>
             <div className="topics-grid">
-              {topics.map(([topic, topicNotes]) => (
-                <div key={topic} className="topic-card" onClick={() => setSelectedTopic(topic)}>
-                  <div className="topic-name">{topic}</div>
-                  <div className="topic-count">{topicNotes.length} консп.</div>
+              {topics.map((topic) => (
+                <div key={topic.name} className="topic-card" onClick={() => setSelectedTopic(topic.name)}>
+                  <div className="topic-name">{topic.name}</div>
+                  <div className="topic-count">{topic.notes.length} консп.</div>
                   <button
                     type="button"
                     className="button button-secondary button-small"

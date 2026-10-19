@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ComponentProps } from 'react'
 import { Tldraw } from 'tldraw'
-import { createTLStore, getSnapshot, loadSnapshot, type TLStore } from '@tldraw/editor'
 import { getAssetUrlsByImport } from '@tldraw/assets/imports.vite'
 import { db } from '../storage/db'
 import { assetStore } from '../storage/assets'
 import { navigate } from '../router'
+
+type TldrawEditor = Parameters<NonNullable<ComponentProps<typeof Tldraw>['onMount']>>[0]
 
 // Шрифты и иконки tldraw берём из самого приложения, а не из CDN,
 // чтобы холст работал без интернета.
@@ -22,69 +23,75 @@ interface NotePageProps {
 
 export function NotePage({ topic, note }: NotePageProps) {
   const path = `${topic}/${note}`
-  const [store, setStore] = useState<TLStore | null>(null)
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved')
+  const [initialSnapshot, setInitialSnapshot] = useState<{ document?: unknown; session?: unknown } | null>(null)
+
   const saveTimeout = useRef<number | undefined>(undefined)
 
-  // Инициализация: загружаем или создаём запись, создаём store, загружаем снапшот.
+  // Загрузка существующего конспекта из Dexie.
+  // Открытие без правок не выставляет dirty = true.
   useEffect(() => {
     let cancelled = false
-
-    async function init() {
-      const now = new Date().toISOString()
-      let record = await db.notes.get(path)
-
-      if (!record) {
-        record = {
-          path,
-          topic,
-          title: note,
-          data: { format: 1, title: note, createdAt: now, updatedAt: now, snapshot: {} },
-          baseSha: null,
-          dirty: true,
-          updatedAt: now
+    void (async () => {
+      try {
+        const record = await db.notes.get(path)
+        if (cancelled) return
+        if (record) {
+          setInitialSnapshot({
+            document: record.data.snapshot,
+            session: record.session
+          })
         }
-        await db.notes.add(record)
+      } catch (error) {
+        console.error('[db] не удалось загрузить конспект', error)
       }
-
-      const newStore = createTLStore({ assets: assetStore })
-      if (record.data.snapshot && Object.keys(record.data.snapshot as object).length > 0) {
-        loadSnapshot(newStore, record.data.snapshot as Parameters<typeof loadSnapshot>[1])
-      }
-
-      if (!cancelled) setStore(newStore)
-    }
-
-    void init()
+    })()
     return () => {
       cancelled = true
     }
-  }, [path, topic, note])
+  }, [path])
 
   // Автосохранение: при правках сохраняем снапшот в Dexie с задержкой 1 секунда.
-  useEffect(() => {
-    if (!store) return
+  // Подписываемся только на пользовательские изменения документа.
+  const onMount = (editor: TldrawEditor) => {
+    // Загружаем локальную сессию (камера, текущий лист), если она есть.
+    if (initialSnapshot?.session && Object.keys(initialSnapshot.session as object).length > 0) {
+      editor.loadSnapshot({ session: initialSnapshot.session as never })
+    }
 
-    const unsubscribe = store.listen(() => {
-      setSaveStatus('saving')
-      window.clearTimeout(saveTimeout.current)
-      saveTimeout.current = window.setTimeout(() => {
-        void saveSnapshot(store)
-      }, 1000)
-    })
+    const unsubscribe = editor.store.listen(
+      () => {
+        setSaveStatus('saving')
+        window.clearTimeout(saveTimeout.current)
+        saveTimeout.current = window.setTimeout(() => {
+          void saveSnapshot(editor)
+        }, 1000)
+      },
+      { source: 'user', scope: 'document' }
+    )
 
     return () => {
       unsubscribe()
       window.clearTimeout(saveTimeout.current)
     }
-  }, [store])
+  }
 
-  const saveSnapshot = async (currentStore: TLStore) => {
+  const saveSnapshot = async (editor: TldrawEditor) => {
     try {
-      const snapshot = getSnapshot(currentStore)
+      const snapshot = editor.getSnapshot()
       const now = new Date().toISOString()
+      // При сохранении обновляем только updatedAt и snapshot.
+      // createdAt остаётся от первоначального создания конспекта.
+      const existing = await db.notes.get(path)
       await db.notes.update(path, {
-        data: { format: 1, title: note, createdAt: now, updatedAt: now, snapshot },
+        data: {
+          format: 1,
+          title: note,
+          createdAt: existing?.data.createdAt ?? now,
+          updatedAt: now,
+          snapshot: snapshot.document
+        },
+        session: snapshot.session,
         dirty: true,
         updatedAt: now
       })
@@ -109,13 +116,13 @@ export function NotePage({ topic, note }: NotePageProps) {
         </span>
       </header>
       <div className="canvas-container">
-        {store && (
-          <Tldraw
-            store={store}
-            assetUrls={assetUrls}
-            licenseKey={licenseKey}
-          />
-        )}
+        <Tldraw
+          assetUrls={assetUrls}
+          licenseKey={licenseKey}
+          snapshot={initialSnapshot as never}
+          assets={assetStore}
+          onMount={onMount}
+        />
       </div>
     </div>
   )

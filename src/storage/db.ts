@@ -3,6 +3,12 @@ import Dexie, { type EntityTable } from 'dexie'
 // Локальное хранилище конспектов и картинок на Dexie (IndexedDB).
 // Всё работает без интернета; синхронизация с GitHub добавляется на этапе 2c.
 
+export interface TopicRecord {
+  // Название темы — первичный ключ.
+  name: string
+  createdAt: string
+}
+
 export interface NoteRecord {
   // Уникальный путь вида "<тема>/<конспект>" — первичный ключ.
   path: string
@@ -10,6 +16,8 @@ export interface NoteRecord {
   title: string
   // Содержимое note.json: { format, title, createdAt, updatedAt, snapshot }.
   data: NoteData
+  // Локальная сессия tldraw (камера, текущий лист) — на GitHub не отправляется.
+  session: unknown
   // SHA файла note.json на момент последней синхронизации (null — ещё не отправлялся).
   baseSha: string | null
   // Есть ли неотправленные правки.
@@ -34,13 +42,18 @@ export interface AssetRecord {
 }
 
 class NotesDB extends Dexie {
+  topics!: EntityTable<TopicRecord, 'name'>
   notes!: EntityTable<NoteRecord, 'path'>
   assets!: EntityTable<AssetRecord, 'name'>
 
   constructor() {
     super('ghnotes')
     this.version(1).stores({
-      // Индексы: path (PK), topic, updatedAt — для списка по темам и сортировки.
+      notes: 'path, topic, updatedAt',
+      assets: 'name'
+    })
+    this.version(2).stores({
+      topics: 'name, createdAt',
       notes: 'path, topic, updatedAt',
       assets: 'name'
     })
