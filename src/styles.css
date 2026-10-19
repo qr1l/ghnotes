@@ -194,3 +194,157 @@ body {
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
   font-size: 15px;
 }
+
+/* Список конспектов */
+
+.list-actions {
+  margin-bottom: 16px;
+}
+
+.topics-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+@media (min-width: 768px) {
+  .topics-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.topic-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.topic-card:hover {
+  border-color: var(--primary);
+}
+
+.topic-name {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.topic-count {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.button-small {
+  min-height: 36px;
+  padding: 0 12px;
+  font-size: 13px;
+  align-self: flex-start;
+}
+
+.notes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.note-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.note-row:hover {
+  border-color: var(--primary);
+}
+
+.note-title {
+  flex: 1;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-date {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* Модальное окно */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  padding: 16px;
+}
+
+.modal {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px;
+  border-radius: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.modal h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.modal input {
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 15px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+/* Холст */
+
+.canvas-container {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.sync-indicator {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.sync-saved {
+  color: var(--ok);
+}
+
+.sync-error {
+  color: var(--error);
+}
