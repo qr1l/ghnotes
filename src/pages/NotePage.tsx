@@ -21,11 +21,29 @@ interface NotePageProps {
   note: string
 }
 
+// Проверка, что снимок документа имеет валидную форму:
+// объект, у которого есть и store (объект), и schema (объект).
+function isValidDocumentSnapshot(data: unknown): data is { store: object; schema: object } {
+  if (!data || typeof data !== 'object') return false
+  const d = data as Record<string, unknown>
+  return (
+    d.store !== null &&
+    typeof d.store === 'object' &&
+    d.schema !== null &&
+    typeof d.schema === 'object'
+  )
+}
+
+// Проверка, что сессия валидна: непустой объект.
+function isValidSession(session: unknown): boolean {
+  return session !== null && typeof session === 'object' && Object.keys(session).length > 0
+}
+
 export function NotePage({ topic, note }: NotePageProps) {
   const path = `${topic}/${note}`
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved')
   const [initialSnapshot, setInitialSnapshot] = useState<{ document?: unknown; session?: unknown } | null>(null)
-
+  const [loadError, setLoadError] = useState(false)
   const saveTimeout = useRef<number | undefined>(undefined)
 
   // Загрузка существующего конспекта из Dexie.
@@ -37,13 +55,29 @@ export function NotePage({ topic, note }: NotePageProps) {
         const record = await db.notes.get(path)
         if (cancelled) return
         if (record) {
-          setInitialSnapshot({
-            document: record.data.snapshot,
-            session: record.session
-          })
+          const document = record.data.snapshot
+          const session = record.session
+
+          if (isValidDocumentSnapshot(document)) {
+            // Валидный снимок: передаём документ и сессию (если она валидна).
+            const snapshot: Record<string, unknown> = { document }
+            if (isValidSession(session)) {
+              snapshot.session = session
+            }
+            setInitialSnapshot(snapshot)
+          } else {
+            // Пустая, null, {} или невалидная форма — не передаваем snapshot вообще,
+            // открываем чистый холст. Старые заметки без schema открываются как пустые.
+            setInitialSnapshot(null)
+          }
         }
       } catch (error) {
-        console.error('[db] не удалось загрузить конспект', error)
+        // Битые данные — открываем чистый холст и показываем предупреждение.
+        // Сохранённые данные не перезаписываем, пока пользователь не изменил заметку.
+        if (!cancelled) {
+          console.error('[db] не удалось загрузить конспект', error)
+          setLoadError(true)
+        }
       }
     })()
     return () => {
@@ -55,7 +89,7 @@ export function NotePage({ topic, note }: NotePageProps) {
   // Подписываемся только на пользовательские изменения документа.
   const onMount = (editor: TldrawEditor) => {
     // Загружаем локальную сессию (камера, текущий лист), если она есть.
-    if (initialSnapshot?.session && Object.keys(initialSnapshot.session as object).length > 0) {
+    if (initialSnapshot?.session && isValidSession(initialSnapshot.session)) {
       editor.loadSnapshot({ session: initialSnapshot.session as never })
     }
 
@@ -80,8 +114,8 @@ export function NotePage({ topic, note }: NotePageProps) {
     try {
       const snapshot = editor.getSnapshot()
       const now = new Date().toISOString()
-      // При сохранении обновляем только updatedAt и snapshot.
-      // createdAt остаётся от первоначального создания конспекта.
+      // В data.snapshot пишем ровно document (объект вида { store, schema }),
+      // не его часть и не обёртку.
       const existing = await db.notes.get(path)
       await db.notes.update(path, {
         data: {
@@ -123,6 +157,11 @@ export function NotePage({ topic, note }: NotePageProps) {
           assets={assetStore}
           onMount={onMount}
         />
+        {loadError && (
+          <div className="load-error-warning">
+            Не удалось прочитать сохранённые данные заметки
+          </div>
+        )}
       </div>
     </div>
   )

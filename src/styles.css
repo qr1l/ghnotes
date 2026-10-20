@@ -348,3 +348,17 @@ body {
 .sync-error {
   color: var(--error);
 }
+
+.load-error-warning {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--warning);
+  color: var(--warning);
+  font-size: 14px;
+  z-index: 10;
+}
