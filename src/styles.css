@@ -349,6 +349,37 @@ body {
   color: var(--error);
 }
 
+.sync-offline {
+  color: var(--muted);
+}
+
+.sync-syncing {
+  color: var(--warning);
+}
+
+.sync-no-connection {
+  color: var(--muted);
+}
+
+.sync-pending {
+  color: var(--warning);
+}
+
+.sync-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sync-dot-synced {
+  background: var(--ok);
+}
+
+.sync-dot-pending {
+  background: var(--warning);
+}
+
 .load-error-warning {
   position: absolute;
   top: 12px;

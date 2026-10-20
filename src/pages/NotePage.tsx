@@ -4,6 +4,8 @@ import { getAssetUrlsByImport } from '@tldraw/assets/imports.vite'
 import { db } from '../storage/db'
 import { assetStore } from '../storage/assets'
 import { navigate } from '../router'
+import { loadSettings } from '../settings'
+import { pushNote, syncOnOpen, type SyncStatus } from '../storage/sync'
 
 type TldrawEditor = Parameters<NonNullable<ComponentProps<typeof Tldraw>['onMount']>>[0]
 
@@ -13,7 +15,7 @@ const assetUrls = getAssetUrlsByImport()
 
 // Ключ лицензии задаётся переменной окружения VITE_TLDRAW_LICENSE_KEY
 // (локально в файле .env.local, на GitHub в Settings → Variables).
-// В режиме разработки (localhost) ключ не нужен.
+// В режим разработки (localhost) ключ не нужен.
 const licenseKey = import.meta.env.VITE_TLDRAW_LICENSE_KEY
 
 interface NotePageProps {
@@ -40,7 +42,6 @@ function isValidSession(session: unknown): boolean {
 }
 
 // Миграция старых снимков: замена префикса "ghasset:" на "asset:" у ассетов типа image.
-// Нужна для совместимости с заметками, созданными до исправления префикса.
 function migrateSnapshotDocument(document: unknown): unknown {
   if (!document || typeof document !== 'object') return document
   const d = document as Record<string, unknown>
@@ -66,41 +67,92 @@ function migrateSnapshotDocument(document: unknown): unknown {
   return { ...d, store: migrated }
 }
 
+function statusLabel(status: SyncStatus | 'saving' | 'saved'): string {
+  switch (status) {
+    case 'synced': return 'Синхронизировано'
+    case 'pending': return 'Не отправлено'
+    case 'syncing': return 'Отправляется…'
+    case 'offline': return 'Офлайн'
+    case 'error': return 'Ошибка'
+    case 'no-connection': return 'Нет подключения'
+    case 'saving': return 'Сохранение…'
+    case 'saved': return 'Сохранено'
+  }
+}
+
 export function NotePage({ topic, note }: NotePageProps) {
   const path = `${topic}/${note}`
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved')
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | 'no-connection'>('synced')
+  const [syncError, setSyncError] = useState<string | null>(null)
   const [initialSnapshot, setInitialSnapshot] = useState<{ document?: unknown; session?: unknown } | null>(null)
   const [loadError, setLoadError] = useState(false)
+  const [conflictMessage, setConflictMessage] = useState<string | null>(null)
   const saveTimeout = useRef<number | undefined>(undefined)
+  const syncTimeout = useRef<number | undefined>(undefined)
 
-  // Загрузка существующего конспекта из Dexie.
-  // Открытие без правок не выставляет dirty = true.
+  // Загрузка существующего конспекта из Dexie + синхронизация при открытии.
   useEffect(() => {
     let cancelled = false
     void (async () => {
       try {
-        const record = await db.notes.get(path)
+        let record = await db.notes.get(path)
         if (cancelled) return
-        if (record) {
-          const document = record.data.snapshot
-          const session = record.session
+
+        // Если записи нет локально — создаём пустую
+        if (!record) {
+          const now = new Date().toISOString()
+          record = {
+            path,
+            topic,
+            title: note,
+            data: { format: 1, title: note, createdAt: now, updatedAt: now, snapshot: {} },
+            session: {},
+            baseSha: null,
+            dirty: true,
+            updatedAt: now
+          }
+          await db.notes.add(record)
+        }
+
+        // Синхронизация с GitHub при открытии (pull/push/конфликт)
+        const settings = loadSettings()
+        if (settings.token && navigator.onLine) {
+          setSyncStatus('syncing')
+          const result = await syncOnOpen(settings, record, (copyTitle) => {
+            setConflictMessage(`Создана копия: «${copyTitle}»`)
+          })
+          if (!cancelled && result) {
+            const data = JSON.parse(result.data) as typeof record.data
+            await db.notes.update(path, {
+              data,
+              baseSha: result.sha,
+              dirty: false,
+              updatedAt: new Date().toISOString()
+            })
+          }
+          if (!cancelled) setSyncStatus('synced')
+        } else if (!settings.token) {
+          if (!cancelled) setSyncStatus('no-connection')
+        }
+
+        // Загрузка снимка в Tldraw
+        const current = await db.notes.get(path)
+        if (!cancelled && current) {
+          const document = current.data.snapshot
+          const session = current.session
 
           if (isValidDocumentSnapshot(document)) {
-            // Валидный снимок: передаём документ и сессию (если она валидна).
             const snapshot: Record<string, unknown> = { document: migrateSnapshotDocument(document) }
             if (isValidSession(session)) {
               snapshot.session = session
             }
             setInitialSnapshot(snapshot)
           } else {
-            // Пустая, null, {} или невалидная форма — не передаваем snapshot вообще,
-            // открываем чистый холст. Старые заметки без schema открываются как пустые.
             setInitialSnapshot(null)
           }
         }
       } catch (error) {
-        // Битые данные — открываем чистый холст и показываем предупреждение.
-        // Сохранённые данные не перезаписываем, пока пользователь не изменил заметку.
         if (!cancelled) {
           console.error('[db] не удалось загрузить конспект', error)
           setLoadError(true)
@@ -110,12 +162,10 @@ export function NotePage({ topic, note }: NotePageProps) {
     return () => {
       cancelled = true
     }
-  }, [path])
+  }, [path, topic, note])
 
-  // Автосохранение: при правках сохраняем снапшот в Dexie с задержкой 1 секунда.
-  // Подписываемся только на пользовательские изменения документа.
+  // Автосохранение + отправка на GitHub.
   const onMount = (editor: TldrawEditor) => {
-    // Загружаем локальную сессию (камера, текущий лист), если она есть.
     if (initialSnapshot?.session && isValidSession(initialSnapshot.session)) {
       editor.loadSnapshot({ session: initialSnapshot.session as never })
     }
@@ -141,8 +191,6 @@ export function NotePage({ topic, note }: NotePageProps) {
     try {
       const snapshot = editor.getSnapshot()
       const now = new Date().toISOString()
-      // В data.snapshot пишем ровно document (объект вида { store, schema }),
-      // не его часть и не обёртку.
       const existing = await db.notes.get(path)
       await db.notes.update(path, {
         data: {
@@ -157,11 +205,46 @@ export function NotePage({ topic, note }: NotePageProps) {
         updatedAt: now
       })
       setSaveStatus('saved')
+
+      // Отправка на GitHub через 10 секунд после последней правки
+      window.clearTimeout(syncTimeout.current)
+      syncTimeout.current = window.setTimeout(() => {
+        void doSync()
+      }, 10000)
     } catch (error) {
       console.error('[db] не удалось сохранить конспект', error)
       setSaveStatus('error')
     }
   }
+
+  const doSync = async () => {
+    const settings = loadSettings()
+    if (!settings.token || !navigator.onLine) {
+      setSyncStatus(settings.token ? 'offline' : 'no-connection')
+      return
+    }
+    setSyncStatus('syncing')
+    try {
+      const record = await db.notes.get(path)
+      if (!record) return
+      const result = await pushNote(settings, record, (status) => {
+        if (!cancelled) setSyncStatus(status)
+      })
+      if (result.status === 'synced') {
+        setSyncStatus('synced')
+        setSyncError(null)
+      } else {
+        setSyncStatus(result.status)
+        setSyncError(result.message ?? null)
+      }
+    } catch (error) {
+      console.error('[sync] ошибка отправки', error)
+      setSyncStatus('error')
+      setSyncError(error instanceof Error ? error.message : 'Неизвестная ошибка')
+    }
+  }
+
+  const cancelled = useRef(false)
 
   return (
     <div className="page note-page">
@@ -172,8 +255,14 @@ export function NotePage({ topic, note }: NotePageProps) {
         <h1 className="topbar-title">
           {topic} / {note}
         </h1>
-        <span className={`sync-indicator sync-${saveStatus}`}>
-          {saveStatus === 'saving' ? 'Сохранение…' : saveStatus === 'error' ? 'Ошибка' : 'Локально'}
+        <button type="button" className="button button-secondary" onClick={() => void doSync()}>
+          Синхронизировать
+        </button>
+        <span
+          className={`sync-indicator sync-${syncStatus === 'syncing' ? 'syncing' : syncStatus === 'synced' ? 'saved' : syncStatus === 'offline' ? 'offline' : syncStatus === 'error' ? 'error' : syncStatus === 'pending' ? 'pending' : 'no-connection'}`}
+          title={syncError ?? undefined}
+        >
+          {statusLabel(syncStatus)}
         </span>
       </header>
       <div className="canvas-container">
@@ -187,6 +276,11 @@ export function NotePage({ topic, note }: NotePageProps) {
         {loadError && (
           <div className="load-error-warning">
             Не удалось прочитать сохранённые данные заметки
+          </div>
+        )}
+        {conflictMessage && (
+          <div className="load-error-warning">
+            {conflictMessage}
           </div>
         )}
       </div>

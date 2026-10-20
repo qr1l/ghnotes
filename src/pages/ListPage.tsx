@@ -1,10 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
-import { db, type NoteRecord } from '../storage/db'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { db, type NoteRecord, type RemoteNoteRecord } from '../storage/db'
 import { buildNotePath, navigate } from '../router'
 import { buildSignature } from '../version'
+import { loadSettings } from '../settings'
+import {
+  cacheRemoteList,
+  deleteNoteRemote,
+  deleteTopicRemote,
+  fetchRemoteList,
+  processPendingDeletes,
+  type SyncStatus
+} from '../storage/sync'
 
 // Правила имён из раздела «Принятые решения»:
-// убираать / \ : * ? " < > |, обрезать пробелы, максимум 60 символов,
+// убирать / \ : * ? " < > |, обрезать пробелы, максимум 60 символов,
 // кириллица разрешена, при совпадении добавлять « (2)», « (3)».
 
 function sanitizeName(name: string): string {
@@ -36,8 +45,11 @@ export function ListPage() {
   const [selectedTopic, setSelectedTopic] = useState<string | null>(null)
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' })
   const [inputValue, setInputValue] = useState('')
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | 'no-connection'>('synced')
+  const [syncError, setSyncError] = useState<string | null>(null)
+  const [truncatedWarning, setTruncatedWarning] = useState(false)
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     const allNotes = await db.notes.toArray()
     allNotes.sort((a, b) => a.topic.localeCompare(b.topic, 'ru') || a.title.localeCompare(b.title, 'ru'))
     setNotes(allNotes)
@@ -48,14 +60,61 @@ export function ListPage() {
       names.add(note.topic)
     }
     setTopicNames(Array.from(names).sort((a, b) => a.localeCompare(b, 'ru')))
-  }
-
-  useEffect(() => {
-    void refresh()
   }, [])
 
-  // Список тем = таблица topics + темы существующих конспектов.
-  // Пустая тема (без конспектов) остаётся в списке.
+  // Загрузка списка из GitHub при монтировании и при появлении сети.
+  useEffect(() => {
+    void refresh()
+
+    const settings = loadSettings()
+    if (!settings.token) {
+      setSyncStatus('no-connection')
+      return
+    }
+
+    if (!navigator.onLine) {
+      setSyncStatus('offline')
+      return
+    }
+
+    setSyncStatus('syncing')
+    void (async () => {
+      try {
+        const remote = await fetchRemoteList(settings)
+        await cacheRemoteList(remote.notes)
+
+        // Удалённые конспекты (которых нет на GitHub и у которых нет dirty) — убираем
+        const remotePaths = new Set(remote.notes.map((n) => `${n.topic}/${n.title}`))
+        const localAll = await db.notes.toArray()
+        for (const local of localAll) {
+          if (!remotePaths.has(local.path) && !local.dirty) {
+            await db.notes.delete(local.path)
+          }
+        }
+
+        // Темы без конспектов на GitHub не удаляем (они только локальные)
+        // Но если тема есть локально и удалена на GitHub — оставляем (GitHub не хранит пустые папки)
+
+        setTruncatedWarning(remote.truncated)
+        setSyncStatus('synced')
+        setSyncError(null)
+        await refresh()
+      } catch (error) {
+        console.error('[sync] не удалось загрузить список', error)
+        setSyncStatus('error')
+        setSyncError(error instanceof Error ? error.message : 'Ошибка GitHub')
+      }
+    })()
+
+    // При появлении сети — повторить синхронизацию
+    const onOnline = () => {
+      void processPendingDeletes(settings)
+      void refresh()
+    }
+    window.addEventListener('online', onOnline)
+    return () => window.removeEventListener('online', onOnline)
+  }, [refresh])
+
   const topics = useMemo<TopicWithNotes[]>(() => {
     const map = new Map<string, NoteRecord[]>()
     for (const note of notes) {
@@ -84,7 +143,6 @@ export function ListPage() {
     }
 
     if (dialog.kind === 'new-topic') {
-      // «Новая тема» создаёт только тему, без конспекта.
       const finalName = uniqueName(name, topicNames)
       if (finalName) {
         await db.topics.add({ name: finalName, createdAt: new Date().toISOString() })
@@ -115,19 +173,34 @@ export function ListPage() {
   const handleDeleteNote = async (note: NoteRecord) => {
     if (!window.confirm(`Удалить конспект «${note.title}»?`)) return
     await db.notes.delete(note.path)
+
+    // Удаление на GitHub (отложенное, если офлайн)
+    const settings = loadSettings()
+    if (settings.token) {
+      setSyncStatus('syncing')
+      const ok = await deleteNoteRemote(settings, note.topic, note.title)
+      setSyncStatus(ok ? 'synced' : 'offline')
+    }
     await refresh()
   }
 
-  // Удаление темы удаляет и её конспекты, с подтверждением.
   const handleDeleteTopic = async (topic: TopicWithNotes) => {
     const message = topic.notes.length > 0
       ? `Удалить тему «${topic.name}» и все её конспекты (${topic.notes.length})?`
       : `Удалить тему «${topic.name}»?`
     if (!window.confirm(message)) return
+
     await db.transaction('rw', db.topics, db.notes, async () => {
       await db.topics.delete(topic.name)
       await db.notes.where('topic').equals(topic.name).delete()
     })
+
+    const settings = loadSettings()
+    if (settings.token && topic.notes.length > 0) {
+      setSyncStatus('syncing')
+      const ok = await deleteTopicRemote(settings, topic.name, topic.notes.map((n) => n.title))
+      setSyncStatus(ok ? 'synced' : 'offline')
+    }
     if (selectedTopic === topic.name) setSelectedTopic(null)
     await refresh()
   }
@@ -152,12 +225,30 @@ export function ListPage() {
           </button>
         )}
         <h1>{selectedTopic ?? 'Конспекты'}</h1>
+        <span
+          className={`sync-indicator sync-${syncStatus === 'syncing' ? 'syncing' : syncStatus === 'synced' ? 'saved' : syncStatus === 'offline' ? 'offline' : syncStatus === 'error' ? 'error' : syncStatus === 'pending' ? 'pending' : 'no-connection'}`}
+          title={syncError ?? undefined}
+          onClick={() => navigate('/settings')}
+        >
+          {syncStatus === 'no-connection' ? 'Нет подключения' :
+           syncStatus === 'syncing' ? 'Синхронизация…' :
+           syncStatus === 'synced' ? 'Синхронизировано' :
+           syncStatus === 'offline' ? 'Офлайн' :
+           syncStatus === 'error' ? 'Ошибка' :
+           syncStatus === 'pending' ? 'Не отправлено' : ''}
+        </span>
         <button type="button" className="button" onClick={() => navigate('/settings')}>
           Настройки
         </button>
       </header>
 
       <main className="page-body">
+        {truncatedWarning && (
+          <div className="load-error-warning">
+            Список из GitHub неполный (truncated). Возможно, не все конспекты отображены.
+          </div>
+        )}
+
         {!selectedTopic ? (
           <>
             <div className="list-actions">
@@ -197,6 +288,7 @@ export function ListPage() {
                 <div key={note.path} className="note-row" onClick={() => openNote(note)}>
                   <div className="note-title">{note.title}</div>
                   <div className="note-date">{new Date(note.updatedAt).toLocaleDateString('ru-RU')}</div>
+                  <span className={`sync-dot ${note.dirty ? 'sync-dot-pending' : 'sync-dot-synced'}`} title={note.dirty ? 'Не отправлено' : 'Синхронизировано'} />
                   <button
                     type="button"
                     className="button button-secondary button-small"

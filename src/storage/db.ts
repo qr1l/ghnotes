@@ -41,10 +41,30 @@ export interface AssetRecord {
   pushed: boolean
 }
 
+// Кэш списка конспектов из GitHub (для офлайн-режима).
+export interface RemoteNoteRecord {
+  // Путь вида "<тема>/<конспект>".
+  path: string
+  topic: string
+  title: string
+  // SHA файла note.json на GitHub.
+  sha: string
+}
+
+// Отложенные удаления (когда нет интернета).
+export interface PendingDeleteRecord {
+  // Путь вида "<тема>/<конспект>" или "<тема>/" для темы.
+  path: string
+  kind: 'note' | 'topic'
+  createdAt: string
+}
+
 class NotesDB extends Dexie {
   topics!: EntityTable<TopicRecord, 'name'>
   notes!: EntityTable<NoteRecord, 'path'>
   assets!: EntityTable<AssetRecord, 'name'>
+  remoteNotes!: EntityTable<RemoteNoteRecord, 'path'>
+  pendingDeletes!: EntityTable<PendingDeleteRecord, 'path'>
 
   constructor() {
     super('ghnotes')
@@ -56,6 +76,13 @@ class NotesDB extends Dexie {
       topics: 'name, createdAt',
       notes: 'path, topic, updatedAt',
       assets: 'name'
+    })
+    this.version(3).stores({
+      topics: 'name, createdAt',
+      notes: 'path, topic, updatedAt',
+      assets: 'name',
+      remoteNotes: 'path, topic',
+      pendingDeletes: 'path'
     })
   }
 }
