@@ -198,7 +198,7 @@ export function ListPage() {
     const settings = loadSettings()
     if (settings.token && topic.notes.length > 0) {
       setSyncStatus('syncing')
-      const ok = await deleteTopicRemote(settings, topic.name, topic.notes.map((n) => n.title))
+      const ok = await deleteTopicRemote(settings, topic.name)
       setSyncStatus(ok ? 'synced' : 'offline')
     }
     if (selectedTopic === topic.name) setSelectedTopic(null)

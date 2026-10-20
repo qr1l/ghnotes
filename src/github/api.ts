@@ -81,6 +81,7 @@ async function requestJson<T>(url: string, token: string, init: RequestInit = {}
   try {
     response = await fetch(url, {
       ...init,
+      cache: 'no-store',
       headers: { ...headers(token), ...(init.headers as Record<string, string> | undefined) }
     })
   } catch {
@@ -182,7 +183,7 @@ export async function getFileRaw(
   const url = `${API_BASE}/repos/${owner}/${repo}/contents/${encodePath(path)}?ref=${encodeURIComponent(branch)}`
   let response: Response
   try {
-    response = await fetch(url, { headers: headers(token, 'application/vnd.github.raw+json') })
+    response = await fetch(url, { cache: 'no-store', headers: headers(token, 'application/vnd.github.raw+json') })
   } catch {
     throw networkError()
   }

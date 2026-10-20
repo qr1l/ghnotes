@@ -5,7 +5,7 @@ import { db } from '../storage/db'
 import { assetStore } from '../storage/assets'
 import { navigate } from '../router'
 import { loadSettings } from '../settings'
-import { pushNote, syncOnOpen, type SyncStatus } from '../storage/sync'
+import { requestPush, syncOnOpen, type SyncStatus } from '../storage/sync'
 
 type TldrawEditor = Parameters<NonNullable<ComponentProps<typeof Tldraw>['onMount']>>[0]
 
@@ -90,14 +90,15 @@ export function NotePage({ topic, note }: NotePageProps) {
   const [conflictMessage, setConflictMessage] = useState<string | null>(null)
   const saveTimeout = useRef<number | undefined>(undefined)
   const syncTimeout = useRef<number | undefined>(undefined)
+  const cancelled = useRef(false)
 
   // Загрузка существующего конспекта из Dexie + синхронизация при открытии.
   useEffect(() => {
-    let cancelled = false
+    cancelled.current = false
     void (async () => {
       try {
         let record = await db.notes.get(path)
-        if (cancelled) return
+        if (cancelled.current) return
 
         // Если записи нет локально — создаём пустую
         if (!record) {
@@ -122,7 +123,7 @@ export function NotePage({ topic, note }: NotePageProps) {
           const result = await syncOnOpen(settings, record, (copyTitle) => {
             setConflictMessage(`Создана копия: «${copyTitle}»`)
           })
-          if (!cancelled && result) {
+          if (!cancelled.current && result) {
             const data = JSON.parse(result.data) as typeof record.data
             await db.notes.update(path, {
               data,
@@ -131,14 +132,14 @@ export function NotePage({ topic, note }: NotePageProps) {
               updatedAt: new Date().toISOString()
             })
           }
-          if (!cancelled) setSyncStatus('synced')
+          if (!cancelled.current) setSyncStatus('synced')
         } else if (!settings.token) {
-          if (!cancelled) setSyncStatus('no-connection')
+          if (!cancelled.current) setSyncStatus('no-connection')
         }
 
         // Загрузка снимка в Tldraw
         const current = await db.notes.get(path)
-        if (!cancelled && current) {
+        if (!cancelled.current && current) {
           const document = current.data.snapshot
           const session = current.session
 
@@ -153,18 +154,51 @@ export function NotePage({ topic, note }: NotePageProps) {
           }
         }
       } catch (error) {
-        if (!cancelled) {
+        if (!cancelled.current) {
           console.error('[db] не удалось загрузить конспект', error)
           setLoadError(true)
         }
       }
     })()
+
+    // Автосохранение + отправка на GitHub через 10 секунд после последней правки
+    // и при скрытии вкладки / появлении сети / закрытии страницы — всё через requestPush
+    const doSync = () => {
+      window.clearTimeout(syncTimeout.current)
+      syncTimeout.current = window.setTimeout(() => {
+        if (!cancelled.current) requestPush(path)
+      }, 10000)
+    }
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        window.clearTimeout(syncTimeout.current)
+        if (!cancelled.current) requestPush(path)
+      }
+    }
+    const onOnline = () => {
+      if (!cancelled.current) requestPush(path)
+    }
+    const onPageHide = () => {
+      if (!cancelled.current) requestPush(path)
+    }
+
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('online', onOnline)
+    window.addEventListener('pagehide', onPageHide)
+
     return () => {
-      cancelled = true
+      cancelled.current = true
+      window.clearTimeout(saveTimeout.current)
+      window.clearTimeout(syncTimeout.current)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('pagehide', onPageHide)
     }
   }, [path, topic, note])
 
-  // Автосохранение + отправка на GitHub.
+  // Автосохранение: при правках сохраняем снапшот в Dexie с задержкой 1 секунда.
+  // Подписываемся только на пользовательские изменения документа.
   const onMount = (editor: TldrawEditor) => {
     if (initialSnapshot?.session && isValidSession(initialSnapshot.session)) {
       editor.loadSnapshot({ session: initialSnapshot.session as never })
@@ -206,45 +240,17 @@ export function NotePage({ topic, note }: NotePageProps) {
       })
       setSaveStatus('saved')
 
-      // Отправка на GitHub через 10 секунд после последней правки
-      window.clearTimeout(syncTimeout.current)
-      syncTimeout.current = window.setTimeout(() => {
-        void doSync()
-      }, 10000)
+      // Запускаем push через единую очередь
+      requestPush(path)
     } catch (error) {
       console.error('[db] не удалось сохранить конспект', error)
       setSaveStatus('error')
     }
   }
 
-  const doSync = async () => {
-    const settings = loadSettings()
-    if (!settings.token || !navigator.onLine) {
-      setSyncStatus(settings.token ? 'offline' : 'no-connection')
-      return
-    }
-    setSyncStatus('syncing')
-    try {
-      const record = await db.notes.get(path)
-      if (!record) return
-      const result = await pushNote(settings, record, (status) => {
-        if (!cancelled) setSyncStatus(status)
-      })
-      if (result.status === 'synced') {
-        setSyncStatus('synced')
-        setSyncError(null)
-      } else {
-        setSyncStatus(result.status)
-        setSyncError(result.message ?? null)
-      }
-    } catch (error) {
-      console.error('[sync] ошибка отправки', error)
-      setSyncStatus('error')
-      setSyncError(error instanceof Error ? error.message : 'Неизвестная ошибка')
-    }
+  const doSync = () => {
+    requestPush(path)
   }
-
-  const cancelled = useRef(false)
 
   return (
     <div className="page note-page">
@@ -255,7 +261,7 @@ export function NotePage({ topic, note }: NotePageProps) {
         <h1 className="topbar-title">
           {topic} / {note}
         </h1>
-        <button type="button" className="button button-secondary" onClick={() => void doSync()}>
+        <button type="button" className="button button-secondary" onClick={doSync}>
           Синхронизировать
         </button>
         <span
