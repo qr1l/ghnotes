@@ -22,7 +22,11 @@ function headers(token: string, accept = 'application/vnd.github+json'): Record<
   }
 }
 
-function errorMessage(status: number): string {
+function errorMessage(status: number, url: string): string {
+  // При 404 на обновление ref — специфичная ошибка про ветку
+  if (status === 404 && url.includes('/git/refs/heads/')) {
+    return 'Ветка не найдена или нет доступа'
+  }
   switch (status) {
     case 401:
       return 'Токен недействителен или истёк'
@@ -60,7 +64,7 @@ async function requestJson<T>(url: string, token: string, init: RequestInit = {}
   } catch {
     throw networkError()
   }
-  if (!response.ok) throw new GitHubApiError(errorMessage(response.status), response.status)
+  if (!response.ok) throw new GitHubApiError(errorMessage(response.status, url), response.status)
   return (await response.json()) as T
 }
 
@@ -136,7 +140,7 @@ export async function getFileRaw(
   } catch {
     throw networkError()
   }
-  if (!response.ok) throw new GitHubApiError(errorMessage(response.status), response.status)
+  if (!response.ok) throw new GitHubApiError(errorMessage(response.status, url), response.status)
   return response.blob()
 }
 
@@ -209,8 +213,12 @@ export async function updateRef(
   sha: string,
   force = false
 ): Promise<GitHubRef> {
-  return requestJson<GitHubRef>(`${API_BASE}/repos/${owner}/${repo}/git/ref/heads/${branch}`, token, {
-    method: 'PATCH',
-    body: JSON.stringify({ sha, force })
-  })
+  return requestJson<GitHubRef>(
+    `${API_BASE}/repos/${owner}/${repo}/git/refs/heads/${branch}`,
+    token,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ sha, force })
+    }
+  )
 }
