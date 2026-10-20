@@ -3,8 +3,10 @@ import {
   createCommit,
   createTree,
   getBranchHead,
+  getCommit,
   getFileRaw,
   getTreeRecursive,
+  GitHubApiError,
   updateRef,
   type GitHubTree
 } from '../github/api'
@@ -34,8 +36,16 @@ function isOnline(): boolean {
   return typeof navigator !== 'undefined' && navigator.onLine
 }
 
+function getErrorMessage(error: unknown): string {
+  if (error instanceof GitHubApiError) {
+    if (error.gitHubMessage) return error.gitHubMessage
+    if (error.gitHubErrors) return error.gitHubErrors
+    return error.message
+  }
+  return error instanceof Error ? error.message : 'Неизвестная ошибка'
+}
+
 // Получить список конспектов из GitHub (getTreeRecursive).
-// Возвращает темы и конспекты (папки с note.json).
 export async function fetchRemoteList(settings: Settings): Promise<{
   topics: string[]
   notes: { topic: string; title: string; sha: string }[]
@@ -115,10 +125,17 @@ export async function pullNote(
 
 // Отправить конспект на GitHub (note.json + картинки с pushed: false).
 // Одним коммитом через Git Data API.
+// Цепочка запросов:
+//   a. GET /git/ref/heads/<branch> → headSha
+//   b. GET /git/commits/<headSha> → tree.sha (baseTreeSha)
+//   c. POST /git/trees с base_tree = baseTreeSha
+//   d. POST /git/commits с parents: [headSha], tree: <новый tree sha>
+//   e. PATCH /git/refs/heads/<branch> с sha: <sha НОВОГО КОММИТА>, force: false
 export async function pushNote(
   settings: Settings,
   note: NoteRecord,
-  onProgress?: (status: SyncStatus) => void): Promise<SyncResult> {
+  onProgress?: (status: SyncStatus) => void
+): Promise<SyncResult> {
   if (!isOnline()) {
     return { status: 'offline', message: 'Нет подключения к интернету' }
   }
@@ -128,33 +145,10 @@ export async function pushNote(
   const path = `${note.topic}/${note.title}`
   const now = new Date().toISOString()
 
-  // 1. Получить ref ветки
-  let headSha: string
-  try {
-    headSha = await getBranchHead(token, owner, repo, branch)
-  } catch (error) {
-    console.error('[sync] не удалось получить head ветки', error)
-    return { status: 'error', message: error instanceof Error ? error.message : 'Ошибка GitHub' }
-  }
-
-  // 2. Получить текущее дерево
-  let tree: GitHubTree
-  try {
-    tree = await getTreeRecursive(token, owner, repo, headSha)
-  } catch (error) {
-    console.error('[sync] не удалось получить дерево', error)
-    return { status: 'error', message: error instanceof Error ? error.message : 'Ошибка GitHub' }
-  }
-
-  // 3. Подготовить blob'ы
-  const treeEntries: { path: string; mode: string; type: 'blob' | 'tree'; sha: string | null }[] = []
-
-  // note.json
+  // Подготовить blob'ы для note.json и картинок
   const noteJson = JSON.stringify(note.data, null, 2)
-  const noteBlob = await createBlob(token, owner, repo, noteJson, 'utf-8')
-  treeEntries.push({ path: `${path}/note.json`, mode: '100644', type: 'blob', sha: noteBlob.sha })
 
-  // Картинки с pushed: false, которые упоминаются в конспекте
+  // Имена картинок, которые нужно отправить
   const assetNames = new Set<string>()
   try {
     const snapshot = note.data.snapshot as { store?: Record<string, { type: string; props?: { type?: string; src?: string } }> }
@@ -171,75 +165,158 @@ export async function pushNote(
     // Игнорируем ошибки разбора снимка
   }
 
-  for (const name of assetNames) {
-    const asset = await db.assets.get(name)
-    if (asset && !asset.pushed) {
-      const base64 = await blobToBase64(asset.blob)
-      const assetBlob = await createBlob(token, owner, repo, base64, 'base64')
-      treeEntries.push({ path: `${path}/assets/${name}`, mode: '100644', type: 'blob', sha: assetBlob.sha })
+  // Подготовить blob'ы
+  const blobs: { name: string; sha: string }[] = []
+  try {
+    const noteBlob = await createBlob(token, owner, repo, noteJson, 'utf-8')
+    blobs.push({ name: `${path}/note.json`, sha: noteBlob.sha })
+
+    for (const name of assetNames) {
+      const asset = await db.assets.get(name)
+      if (asset && !asset.pushed) {
+        const base64 = await blobToBase64(asset.blob)
+        const assetBlob = await createBlob(token, owner, repo, base64, 'base64')
+        blobs.push({ name: `${path}/assets/${name}`, sha: assetBlob.sha })
+      }
     }
+  } catch (error) {
+    console.error('[sync] не удалось создать blob', error)
+    return { status: 'error', message: getErrorMessage(error) }
   }
 
-  // 4. Создать tree
-  const baseTree = tree.tree.map((entry) => ({
-    path: entry.path,
-    mode: entry.mode,
-    type: entry.type,
-    sha: entry.sha
-  }))
-
-  // Удаляем старые записи для этого конспекта (note.json и assets)
-  const filteredBaseTree = baseTree.filter(
-    (entry) => !entry.path.startsWith(`${path}/`)
-  )
-
-  const newTree = await createTree(token, owner, repo, headSha, [...filteredBaseTree, ...treeEntries])
-
-  // 5. Создать commit
-  const commit = await createCommit(
-    token,
-    owner,
-    repo,
-    `Update ${path}`,
-    newTree.sha,
-    [headSha]
-  )
-
-  // 6. Обновить ref (с одним повтором при отклонении)
+  // Цепочка push с одним повтором при 422
   try {
-    await updateRef(token, owner, repo, branch, commit.sha, false)
-  } catch (error) {
-    // Ветка ушла вперёд — повторяем один раз
-    try {
-      const newHeadSha = await getBranchHead(token, owner, repo, branch)
-      const newHeadTree = await getTreeRecursive(token, owner, repo, newHeadSha)
-      const retryBaseTree = newHeadTree.tree.map((entry) => ({
+    // a. Получить текущий headSha
+    const headSha = await getBranchHead(token, owner, repo, branch)
+
+    // b. Получить tree.sha (baseTreeSha)
+    const headCommit = await getCommit(token, owner, repo, headSha)
+    const baseTreeSha = headCommit.tree.sha
+
+    // c. Создать новое дерево на основе baseTreeSha
+    // Оставляем все существующие файлы, кроме тех, что относятся к этому конспекту
+    const existingTree = await getTreeRecursiveSafe(token, owner, repo, baseTreeSha, headSha)
+    const existingEntries = existingTree.tree
+      .filter((entry) => !entry.path.startsWith(`${path}/`))
+      .map((entry) => ({
         path: entry.path,
         mode: entry.mode,
         type: entry.type,
         sha: entry.sha
-      })).filter((entry) => !entry.path.startsWith(`${path}/`))
-      const retryTree = await createTree(token, owner, repo, newHeadSha, [...retryBaseTree, ...treeEntries])
-      const retryCommit = await createCommit(token, owner, repo, `Update ${path}`, retryTree.sha, [newHeadSha])
-      await updateRef(token, owner, repo, branch, retryCommit.sha, false)
-    } catch (retryError) {
-      console.error('[sync] не удалось обновить ref', retryError)
-      return { status: 'error', message: 'Конфликт версий' }
+      }))
+
+    const treeEntries = [
+      ...existingEntries,
+      ...blobs.map((blob) => ({
+        path: blob.name,
+        mode: '100644' as const,
+        type: 'blob' as const,
+        sha: blob.sha
+      }))
+    ]
+
+    const newTree = await createTree(token, owner, repo, baseTreeSha, treeEntries)
+
+    // d. Создать коммит с parents: [headSha]
+    const commit = await createCommit(
+      token,
+      owner,
+      repo,
+      `Update ${path}`,
+      newTree.sha,
+      [headSha]
+    )
+
+    // e. Обновить ref с sha НОВОГО КОММИТА
+    await updateRef(token, owner, repo, branch, commit.sha, false)
+
+    // После успеха обновить локальные данные
+    await db.notes.update(note.path, {
+      baseSha: commit.sha,
+      dirty: false,
+      updatedAt: now
+    })
+    for (const name of assetNames) {
+      await db.assets.update(name, { pushed: true })
     }
-  }
 
-  // 7. После успеха обновить локальные данные
-  await db.notes.update(note.path, {
-    baseSha: commit.sha,
-    dirty: false,
-    updatedAt: now
-  })
-  for (const name of assetNames) {
-    await db.assets.update(name, { pushed: true })
-  }
+    onProgress?.('synced')
+    return { status: 'synced' }
+  } catch (error) {
+    // При 422 «not a fast forward» — один повтор с шага a
+    if (error instanceof GitHubApiError && error.status === 422) {
+      try {
+        const headSha = await getBranchHead(token, owner, repo, branch)
+        const headCommit = await getCommit(token, owner, repo, headSha)
+        const baseTreeSha = headCommit.tree.sha
 
-  onProgress?.('synced')
-  return { status: 'synced' }
+        const existingTree = await getTreeRecursiveSafe(token, owner, repo, baseTreeSha, headSha)
+        const existingEntries = existingTree.tree
+          .filter((entry) => !entry.path.startsWith(`${path}/`))
+          .map((entry) => ({
+            path: entry.path,
+            mode: entry.mode,
+            type: entry.type,
+            sha: entry.sha
+          }))
+
+        const treeEntries = [
+          ...existingEntries,
+          ...blobs.map((blob) => ({
+            path: blob.name,
+            mode: '100644' as const,
+            type: 'blob' as const,
+            sha: blob.sha
+          }))
+        ]
+
+        const newTree = await createTree(token, owner, repo, baseTreeSha, treeEntries)
+        const commit = await createCommit(
+          token,
+          owner,
+          repo,
+          `Update ${path}`,
+          newTree.sha,
+          [headSha]
+        )
+        await updateRef(token, owner, repo, branch, commit.sha, false)
+
+        await db.notes.update(note.path, {
+          baseSha: commit.sha,
+          dirty: false,
+          updatedAt: now
+        })
+        for (const name of assetNames) {
+          await db.assets.update(name, { pushed: true })
+        }
+
+        onProgress?.('synced')
+        return { status: 'synced' }
+      } catch (retryError) {
+        console.error('[sync] не удалось повторить push', retryError)
+        return { status: 'error', message: getErrorMessage(retryError) }
+      }
+    }
+
+    console.error('[sync] не удалось отправить', error)
+    return { status: 'error', message: getErrorMessage(error) }
+  }
+}
+
+// Безопасное получение дерева (игнорируем ошибки и возвращаем пустое)
+async function getTreeRecursiveSafe(
+  token: string,
+  owner: string,
+  repo: string,
+  sha: string,
+  _headSha: string
+): Promise<GitHubTree> {
+  try {
+    return await getTreeRecursive(token, owner, repo, sha)
+  } catch (error) {
+    console.error('[sync] не удалось получить дерево, используем пустое', error)
+    return { sha, tree: [], truncated: false }
+  }
 }
 
 // Удалить конспект на GitHub (отдельный коммит с sha: null).
@@ -249,7 +326,6 @@ export async function deleteNoteRemote(
   title: string
 ): Promise<boolean> {
   if (!isOnline()) {
-    // Отложить удаление
     await db.pendingDeletes.add({
       path: `${topic}/${title}`,
       kind: 'note',
@@ -263,9 +339,10 @@ export async function deleteNoteRemote(
 
   try {
     const headSha = await getBranchHead(token, owner, repo, branch)
-    const tree = await getTreeRecursive(token, owner, repo, headSha)
+    const headCommit = await getCommit(token, owner, repo, headSha)
+    const baseTreeSha = headCommit.tree.sha
+    const tree = await getTreeRecursive(token, owner, repo, baseTreeSha)
 
-    // Оставляем только записи, не относящиеся к этому конспекту
     const baseTree = tree.tree
       .filter((entry) => !entry.path.startsWith(`${path}/`))
       .map((entry) => ({
@@ -275,7 +352,6 @@ export async function deleteNoteRemote(
         sha: entry.sha
       }))
 
-    // Проставляем sha: null для удалённых файлов
     const deletedEntries = tree.tree
       .filter((entry) => entry.path.startsWith(`${path}/`) && entry.type === 'blob')
       .map((entry) => ({
@@ -285,13 +361,12 @@ export async function deleteNoteRemote(
         sha: null
       }))
 
-    const newTree = await createTree(token, owner, repo, headSha, [...baseTree, ...deletedEntries])
+    const newTree = await createTree(token, owner, repo, baseTreeSha, [...baseTree, ...deletedEntries])
     const commit = await createCommit(token, owner, repo, `Delete ${path}`, newTree.sha, [headSha])
     await updateRef(token, owner, repo, branch, commit.sha, false)
     return true
   } catch (error) {
     console.error('[sync] не удалось удалить конспект', error)
-    // Отложить удаление
     await db.pendingDeletes.add({
       path: `${topic}/${title}`,
       kind: 'note',
@@ -305,7 +380,7 @@ export async function deleteNoteRemote(
 export async function deleteTopicRemote(
   settings: Settings,
   topic: string,
-  noteTitles: string[]
+  _noteTitles: string[]
 ): Promise<boolean> {
   if (!isOnline()) {
     await db.pendingDeletes.add({
@@ -320,7 +395,9 @@ export async function deleteTopicRemote(
 
   try {
     const headSha = await getBranchHead(token, owner, repo, branch)
-    const tree = await getTreeRecursive(token, owner, repo, headSha)
+    const headCommit = await getCommit(token, owner, repo, headSha)
+    const baseTreeSha = headCommit.tree.sha
+    const tree = await getTreeRecursive(token, owner, repo, baseTreeSha)
 
     const prefix = `${topic}/`
     const baseTree = tree.tree
@@ -341,7 +418,7 @@ export async function deleteTopicRemote(
         sha: null
       }))
 
-    const newTree = await createTree(token, owner, repo, headSha, [...baseTree, ...deletedEntries])
+    const newTree = await createTree(token, owner, repo, baseTreeSha, [...baseTree, ...deletedEntries])
     const commit = await createCommit(token, owner, repo, `Delete ${topic}`, newTree.sha, [headSha])
     await updateRef(token, owner, repo, branch, commit.sha, false)
     return true
@@ -387,6 +464,8 @@ async function blobToBase64(blob: Blob): Promise<string> {
 }
 
 // Синхронизация при открытии конспекта по правилам из документа.
+// Конфликт — только когда dirty === true И remote sha !== baseSha.
+// Для заметки, которой ещё нет на GitHub (baseSha === null), конфликта быть не должно: просто push.
 export async function syncOnOpen(
   settings: Settings,
   note: NoteRecord,
@@ -400,7 +479,19 @@ export async function syncOnOpen(
   try {
     // 1. Получить текущий sha удалённого note.json
     const remote = await db.remoteNotes.get(path)
-    if (!remote) return null
+    if (!remote) {
+      // Заметки нет на GitHub — если локальная dirty, просто push
+      if (note.dirty) {
+        const result = await pushNote(settings, note)
+        if (result.status === 'synced') {
+          const updated = await db.notes.get(note.path)
+          if (updated) {
+            return { data: JSON.stringify(updated.data), sha: updated.baseSha ?? '' }
+          }
+        }
+      }
+      return null
+    }
 
     // 2. Если dirty = false и удалённый sha отличается от baseSha: скачать
     if (!note.dirty && remote.sha !== note.baseSha) {
@@ -429,6 +520,7 @@ export async function syncOnOpen(
     }
 
     // 4. Конфликт: dirty = true и удалённый sha отличается от baseSha
+    // Создаём копию ТОЛЬКО если локальная заметка реально менялась
     if (note.dirty && remote.sha !== note.baseSha) {
       // Скачиваем удалённую версию как основу
       const remoteResult = await pullNote(settings, note.topic, note.title)

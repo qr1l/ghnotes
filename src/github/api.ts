@@ -3,11 +3,15 @@
 
 export class GitHubApiError extends Error {
   readonly status: number
+  readonly gitHubMessage?: string
+  readonly gitHubErrors?: string
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, gitHubMessage?: string, gitHubErrors?: string) {
     super(message)
     this.name = 'GitHubApiError'
     this.status = status
+    this.gitHubMessage = gitHubMessage
+    this.gitHubErrors = gitHubErrors
   }
 }
 
@@ -54,6 +58,24 @@ function encodePath(path: string): string {
     .join('/')
 }
 
+// Логирование ошибки GitHub (без токена и заголовков)
+function logGitHubError(method: string, url: string, status: number, message: string) {
+  const urlObj = new URL(url)
+  console.error(`[github] ${method} ${urlObj.pathname} → ${status}: ${message}`)
+}
+
+async function parseErrorBody(response: Response): Promise<{ message?: string; errors?: string }> {
+  try {
+    const body = await response.json() as { message?: string; errors?: Array<{ message: string }> }
+    return {
+      message: body.message,
+      errors: body.errors?.map((e) => e.message).join('; ')
+    }
+  } catch {
+    return {}
+  }
+}
+
 async function requestJson<T>(url: string, token: string, init: RequestInit = {}): Promise<T> {
   let response: Response
   try {
@@ -64,7 +86,13 @@ async function requestJson<T>(url: string, token: string, init: RequestInit = {}
   } catch {
     throw networkError()
   }
-  if (!response.ok) throw new GitHubApiError(errorMessage(response.status, url), response.status)
+  if (!response.ok) {
+    const body = await parseErrorBody(response)
+    const fallback = errorMessage(response.status, url)
+    const message = body.message ?? fallback
+    logGitHubError(init.method ?? 'GET', url, response.status, message)
+    throw new GitHubApiError(fallback, response.status, body.message, body.errors)
+  }
   return (await response.json()) as T
 }
 
@@ -99,6 +127,24 @@ export async function getBranchHead(token: string, owner: string, repo: string, 
     token
   )
   return ref.object.sha
+}
+
+export interface GitHubCommit {
+  sha: string
+  message: string
+  tree: {
+    sha: string
+  }
+}
+
+// Получает коммит по sha (нужен для получения tree.sha).
+export async function getCommit(
+  token: string,
+  owner: string,
+  repo: string,
+  sha: string
+): Promise<GitHubCommit> {
+  return requestJson<GitHubCommit>(`${API_BASE}/repos/${owner}/${repo}/git/commits/${sha}`, token)
 }
 
 export interface GitHubTreeNode {
@@ -140,7 +186,13 @@ export async function getFileRaw(
   } catch {
     throw networkError()
   }
-  if (!response.ok) throw new GitHubApiError(errorMessage(response.status, url), response.status)
+  if (!response.ok) {
+    const body = await parseErrorBody(response)
+    const fallback = errorMessage(response.status, url)
+    const message = body.message ?? fallback
+    logGitHubError('GET', url, response.status, message)
+    throw new GitHubApiError(fallback, response.status, body.message, body.errors)
+  }
   return response.blob()
 }
 
