@@ -3,13 +3,13 @@ import { db } from './db'
 
 // Собственное хранилище картинок для tldraw.
 // Картинки сжимаются в WebP (макс. сторона 2000 px, качество 0.8),
-// хэшируются SHA-256 и хранятся в IndexedDB. Ссылка вида ghasset:<имя>.
+// хэшируются SHA-256 и хранятся в IndexedDB. Ссылка вида asset:<имя>.
 // Скачивание из GitHub добавляется на этапе 2c.
 
 const MAX_SIZE = 10 * 1024 * 1024 // 10 МБ
 const MAX_SIDE = 2000
 const QUALITY = 0.8
-const PREFIX = 'ghasset:'
+const PREFIX = 'asset:'
 
 // Кэш blob-ссылок, чтобы не создавать новые при каждом resolve.
 const urlCache = new Map<string, string>()

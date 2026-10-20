@@ -39,6 +39,33 @@ function isValidSession(session: unknown): boolean {
   return session !== null && typeof session === 'object' && Object.keys(session).length > 0
 }
 
+// Миграция старых снимков: замена префикса "ghasset:" на "asset:" у ассетов типа image.
+// Нужна для совместимости с заметками, созданными до исправления префикса.
+function migrateSnapshotDocument(document: unknown): unknown {
+  if (!document || typeof document !== 'object') return document
+  const d = document as Record<string, unknown>
+  const store = d.store
+  if (!store || typeof store !== 'object') return document
+
+  const migrated: Record<string, unknown> = {}
+  for (const [id, record] of Object.entries(store)) {
+    const r = record as Record<string, unknown>
+    const props = r?.props as Record<string, unknown> | undefined
+    if (r?.type === 'asset' && props?.type === 'image') {
+      const src = props.src
+      if (typeof src === 'string' && src.startsWith('ghasset:')) {
+        migrated[id] = {
+          ...r,
+          props: { ...props, src: 'asset:' + src.slice('ghasset:'.length) }
+        }
+        continue
+      }
+    }
+    migrated[id] = record
+  }
+  return { ...d, store: migrated }
+}
+
 export function NotePage({ topic, note }: NotePageProps) {
   const path = `${topic}/${note}`
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved')
@@ -60,7 +87,7 @@ export function NotePage({ topic, note }: NotePageProps) {
 
           if (isValidDocumentSnapshot(document)) {
             // Валидный снимок: передаём документ и сессию (если она валидна).
-            const snapshot: Record<string, unknown> = { document }
+            const snapshot: Record<string, unknown> = { document: migrateSnapshotDocument(document) }
             if (isValidSession(session)) {
               snapshot.session = session
             }
