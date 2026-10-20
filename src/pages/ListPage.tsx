@@ -52,11 +52,17 @@ export function ListPage() {
   const refresh = useCallback(async () => {
     const allNotes = await db.notes.toArray()
     allNotes.sort((a, b) => a.topic.localeCompare(b.topic, 'ru') || a.title.localeCompare(b.title, 'ru'))
-    setNotes(allNotes)
+
+    // Скрываем конспекты, которые в pendingDeletes (удаляются)
+    const pending = await db.pendingDeletes.toArray()
+    const pendingPaths = new Set(pending.map((p) => p.path))
+    const visibleNotes = allNotes.filter((note) => !pendingPaths.has(note.path))
+
+    setNotes(visibleNotes)
 
     const allTopics = await db.topics.toArray()
     const names = new Set(allTopics.map((topic) => topic.name))
-    for (const note of allNotes) {
+    for (const note of visibleNotes) {
       names.add(note.topic)
     }
     setTopicNames(Array.from(names).sort((a, b) => a.localeCompare(b, 'ru')))
@@ -70,6 +76,11 @@ export function ListPage() {
     if (!settings.token) {
       setSyncStatus('no-connection')
       return
+    }
+
+    // При старте пробуем выполнить отложенные удаления
+    if (navigator.onLine) {
+      void processPendingDeletes(loadSettings())
     }
 
     if (!navigator.onLine) {
@@ -172,9 +183,13 @@ export function ListPage() {
 
   const handleDeleteNote = async (note: NoteRecord) => {
     if (!window.confirm(`Удалить конспект «${note.title}»?`)) return
+    // 1. Сначала записываем в pendingDeletes (надёжность)
+    await db.pendingDeletes.add({ path: note.path, kind: 'note', createdAt: new Date().toISOString() })
+
+    // 2. Локальное удаление
     await db.notes.delete(note.path)
 
-    // Удаление на GitHub (отложенное, если офлайн)
+    // 3. Попытка удалить на GitHub через общую очередь записи
     const settings = loadSettings()
     if (settings.token) {
       setSyncStatus('syncing')
@@ -190,19 +205,30 @@ export function ListPage() {
       : `Удалить тему «${topic.name}»?`
     if (!window.confirm(message)) return
 
+    // 1. Сначала записываем в pendingDeletes
+    await db.pendingDeletes.add({ path: `${topic.name}/`, kind: 'topic', createdAt: new Date().toISOString() })
+
+    // 2. Локальное удаление
     await db.transaction('rw', db.topics, db.notes, async () => {
       await db.topics.delete(topic.name)
       await db.notes.where('topic').equals(topic.name).delete()
     })
 
+    // 3. Попытка удалить на GitHub через общую очередь записи
     const settings = loadSettings()
-    if (settings.token && topic.notes.length > 0) {
+    if (settings.token) {
       setSyncStatus('syncing')
       const ok = await deleteTopicRemote(settings, topic.name)
       setSyncStatus(ok ? 'synced' : 'offline')
     }
     if (selectedTopic === topic.name) setSelectedTopic(null)
     await refresh()
+
+    // 6. Если у темы не осталось конспектов — удалить пустую локальную тему
+    const remaining = await db.notes.where('topic').equals(topic.name).count()
+    if (remaining === 0) {
+      await db.topics.delete(topic.name)
+    }
   }
 
   const openDialog = (kind: DialogState['kind'], topic?: string) => {

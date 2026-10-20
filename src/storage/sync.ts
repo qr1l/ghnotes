@@ -102,6 +102,8 @@ export function requestPush(notePath: string): void {
         } else if (current) {
           // Заметка менялась пока шёл пуш — оставляем dirty = true, запросим повторный push
         }
+        // После успешного push пробуем выполнить отложенные удаления
+        await processPendingDeletes(settings)
       }
     } finally {
       pushingNotes.delete(notePath)
@@ -289,6 +291,7 @@ export async function pullNote(
 }
 
 // Удалить конспект на GitHub (отдельный коммит с sha: null).
+// Из pendingDeletes убираем только после успешного коммита или если файла уже нет.
 export async function deleteNoteRemote(
   settings: Settings,
   topic: string,
@@ -296,11 +299,7 @@ export async function deleteNoteRemote(
 ): Promise<boolean> {
   return enqueueWrite(async () => {
     if (!isOnline()) {
-      await db.pendingDeletes.add({
-        path: `${topic}/${title}`,
-        kind: 'note',
-        createdAt: new Date().toISOString()
-      })
+      // Офлайн — запись уже должна быть в pendingDeletes (добавлена перед локальным удалением)
       return false
     }
 
@@ -313,40 +312,48 @@ export async function deleteNoteRemote(
       const baseTreeSha = headCommit.tree.sha
       const tree = await getTreeRecursive(token, owner, repo, baseTreeSha)
 
-      const keepEntries = tree.tree
-        .filter((entry) => !entry.path.startsWith(`${path}/`))
-        .map((entry) => ({ path: entry.path, mode: entry.mode, type: entry.type, sha: entry.sha }))
-
+      // Собираем все блобы под <Тема>/<Конспект>/
       const deletedEntries: GitHubTreeEntry[] = tree.tree
         .filter((entry) => entry.path.startsWith(`${path}/`) && entry.type === 'blob')
         .map((entry) => ({ path: entry.path, mode: entry.mode, type: 'blob', sha: null }))
 
+      // Если ничего не найдено — считаем удалённым
+      if (deletedEntries.length === 0) {
+        await db.pendingDeletes.delete(path)
+        return true
+      }
+
+      // Оставляем все файлы, не относящиеся к этому конспекту
+      const keepEntries = tree.tree
+        .filter((entry) => !entry.path.startsWith(`${path}/`))
+        .map((entry) => ({ path: entry.path, mode: entry.mode, type: entry.type, sha: entry.sha }))
+
       const result = await commitFiles(settings, `Delete ${path}`, [...keepEntries, ...deletedEntries])
-      return result.status === 'synced'
+
+      // Убираем из pendingDeletes только после успешного коммита
+      if (result.status === 'synced') {
+        await db.pendingDeletes.delete(path)
+        return true
+      }
+      // При ошибке запись остаётся в pendingDeletes для повтора
+      return false
     } catch (error) {
       console.error('[sync] не удалось удалить конспект', error)
-      await db.pendingDeletes.add({
-        path: `${topic}/${title}`,
-        kind: 'note',
-        createdAt: new Date().toISOString()
-      })
+      // Запись остаётся в pendingDeletes для повтора
       return false
     }
   })
 }
 
 // Удалить тему на GitHub (все её конспекты).
+// Из pendingDeletes убираем только после успешного коммита или если файлов уже нет.
 export async function deleteTopicRemote(
   settings: Settings,
   topic: string
 ): Promise<boolean> {
   return enqueueWrite(async () => {
     if (!isOnline()) {
-      await db.pendingDeletes.add({
-        path: `${topic}/`,
-        kind: 'topic',
-        createdAt: new Date().toISOString()
-      })
+      // Офлайн — запись уже должна быть в pendingDeletes (добавлена перед локальным удалением)
       return false
     }
 
@@ -359,45 +366,53 @@ export async function deleteTopicRemote(
       const tree = await getTreeRecursive(token, owner, repo, baseTreeSha)
 
       const prefix = `${topic}/`
-      const keepEntries = tree.tree
-        .filter((entry) => !entry.path.startsWith(prefix))
-        .map((entry) => ({ path: entry.path, mode: entry.mode, type: entry.type, sha: entry.sha }))
 
+      // Собираем все блобы под <Тема>/
       const deletedEntries: GitHubTreeEntry[] = tree.tree
         .filter((entry) => entry.path.startsWith(prefix) && entry.type === 'blob')
         .map((entry) => ({ path: entry.path, mode: entry.mode, type: 'blob', sha: null }))
 
+      // Если ничего не найдено — считаем удалённым
+      if (deletedEntries.length === 0) {
+        await db.pendingDeletes.delete(prefix)
+        return true
+      }
+
+      const keepEntries = tree.tree
+        .filter((entry) => !entry.path.startsWith(prefix))
+        .map((entry) => ({ path: entry.path, mode: entry.mode, type: entry.type, sha: entry.sha }))
+
       const result = await commitFiles(settings, `Delete ${topic}`, [...keepEntries, ...deletedEntries])
-      return result.status === 'synced'
+
+      // Убираем из pendingDeletes только после успешного коммита
+      if (result.status === 'synced') {
+        await db.pendingDeletes.delete(prefix)
+        return true
+      }
+      // При ошибке запись остаётся в pendingDeletes для повтора
+      return false
     } catch (error) {
       console.error('[sync] не удалось удалить тему', error)
-      await db.pendingDeletes.add({
-        path: `${topic}/`,
-        kind: 'topic',
-        createdAt: new Date().toISOString()
-      })
+      // Запись остаётся в pendingDeletes для повтора
       return false
     }
   })
 }
 
-// Выполнить отложенные удаления при появлении сети.
+// Выполнить отложенные удаления через очередь записи.
+// Вызывается: при старте, при online, после успешного push, по кнопке «Синхронизировать».
 export async function processPendingDeletes(settings: Settings): Promise<void> {
   if (!isOnline()) return
   const pending = await db.pendingDeletes.toArray()
   for (const item of pending) {
-    try {
-      if (item.kind === 'note') {
-        const [topic, title] = item.path.split('/')
-        await deleteNoteRemote(settings, topic, title)
-      } else {
-        const topic = item.path.replace(/\/$/, '')
-        await deleteTopicRemote(settings, topic)
-      }
-      await db.pendingDeletes.delete(item.path)
-    } catch (error) {
-      console.error('[sync] не удалось выполнить отложенное удаление', error)
+    if (item.kind === 'note') {
+      const [topic, title] = item.path.split('/')
+      await deleteNoteRemote(settings, topic, title)
+    } else {
+      const topic = item.path.replace(/\/$/, '')
+      await deleteTopicRemote(settings, topic)
     }
+    // Удаление из pendingDeletes происходит внутри deleteNoteRemote/deleteTopicRemote при успехе
   }
 }
 
